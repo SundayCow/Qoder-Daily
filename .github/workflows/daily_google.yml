@@ -1,4 +1,4 @@
-name: Qoder Daily
+name: Qoder Daily (Google)
 
 on:
   # 上游仓库默认不跑定时，避免空跑。
