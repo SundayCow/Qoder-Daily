@@ -1,4 +1,4 @@
-name: Qoder Daily (Account 3)
+name: Qoder Daily (cymduoduo2)
 
 # 账号2 专用工作流：与 daily.yml 使用不同的 runner、缓存前缀和 secret，
 # 从而获得独立的设备身份（qoder_machine_id），避免与账号1 触发同设备限领。
