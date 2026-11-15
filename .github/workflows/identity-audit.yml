@@ -1,0 +1,166 @@
+name: Qoder Identity Audit (设备/账号对拍)
+
+# 只读诊断：对每个账号打印 备注 / token 指纹 / 上游 UID / qoder_machine_id 指纹 / 固定主机名。
+# 除了一次只读的活动列表查询（仅为取 UID）以外不发任何请求，不签到、不写 cache。
+#
+# 用法：Actions -> Qoder Identity Audit -> Run workflow，看 Run summary。
+# 判读：
+#   - 两个账号的 UID 指纹相同   -> 同一个 Qoder 账号（不同登录会话 token 不同，UID 相同），
+#                                  当天只能领一次，后跑的一定没活动行
+#   - 3/4/5 的 machine_id 相同  -> 缓存前缀撞了，大家恢复到了同一份 state
+#   - 指纹全不相同仍没活动行    -> 该账号今天已经领过，或上游没给它下发活动
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "账号1"
+            slot: "1"
+            prefix: "qoder-state-v2-"
+            host: "未固定"
+          - label: "账号2"
+            slot: "2"
+            prefix: "qoder-account2-state-v2-"
+            host: "qoder-account2-actions"
+          - label: "账号3"
+            slot: "3"
+            prefix: "qoder-account3-state-v2-"
+            host: "qoder-account3-actions"
+          - label: "账号4"
+            slot: "4"
+            prefix: "qoder-account4-state-v2-"
+            host: "qoder-account4-actions"
+          - label: "账号5"
+            slot: "5"
+            prefix: "qoder-account5-state-v2-"
+            host: "qoder-account5-actions"
+    env:
+      QODER_CACHE_KEY: ${{ secrets.QODER_CACHE_KEY }}
+    steps:
+      - name: Restore encrypted state
+        uses: actions/cache/restore@v4
+        with:
+          path: .qoder-cache/state.enc
+          key: ${{ matrix.prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ matrix.prefix }}
+
+      - name: Decrypt state
+        if: ${{ env.QODER_CACHE_KEY != '' && hashFiles('.qoder-cache/state.enc') != '' }}
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -salt -pass env:QODER_CACHE_KEY -in .qoder-cache/state.enc -out "$RUNNER_TEMP/state.tar"
+          tar -xf "$RUNNER_TEMP/state.tar" -C .
+          rm -f "$RUNNER_TEMP/state.tar"
+
+      - name: Report
+        env:
+          LABEL: ${{ matrix.label }}
+          SLOT: ${{ matrix.slot }}
+          HOST: ${{ matrix.host }}
+          TOKENS_1: ${{ secrets.QODER_GLOBAL_TOKENS }}
+          TOKENS_2: ${{ secrets.QODER_GLOBAL_TOKENS_2 }}
+          TOKENS_3: ${{ secrets.QODER_GLOBAL_TOKENS_3 }}
+          TOKENS_4: ${{ secrets.QODER_GLOBAL_TOKENS_4 }}
+          TOKENS_5: ${{ secrets.QODER_GLOBAL_TOKENS_5 }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import ssl
+          import urllib.error
+          import urllib.request
+
+          BASES = {"global": "https://openapi.qoder.sh", "cn": "https://openapi.qoder.com.cn"}
+          PATH = "/sash/api/v1/me/campaigns"
+
+          label = os.environ["LABEL"]
+          host = os.environ["HOST"]
+          raw = (os.environ.get("TOKENS_" + os.environ["SLOT"]) or "").strip()
+          first = next((x.strip() for x in raw.replace("&", "\n").splitlines() if x.strip()), "")
+          fields = [f.strip() for f in first.split("|")] if first else []
+          if not fields:
+              note, access = "(未配置 token)", ""
+          elif len(fields) >= 3:
+              note, access = fields[0], fields[1]
+          else:
+              note, access = "(无备注)", fields[0]
+
+          def fp(value):
+              return hashlib.sha256(value.encode()).hexdigest()[:12] if value else "-"
+
+          def uid_of(region):
+              req = urllib.request.Request(
+                  BASES[region] + PATH,
+                  headers={
+                      "authorization": "Bearer " + access,
+                      "cosy-clienttype": "10",
+                      "accept": "application/json",
+                      "accept-language": "zh-CN",
+                      "user-agent": "Qoder",
+                  },
+              )
+              ctx = ssl.create_default_context()
+              ctx.check_hostname = False
+              ctx.verify_mode = ssl.CERT_NONE
+              try:
+                  with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+                      payload = json.loads(resp.read().decode("utf-8", "replace"))
+              except urllib.error.HTTPError as exc:
+                  return None, region + " HTTP %s" % exc.code
+              except Exception as exc:  # noqa: BLE001
+                  return None, region + " " + type(exc).__name__
+              bodies = [payload]
+              if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                  bodies.append(payload["data"])
+              for body in bodies:
+                  if not isinstance(body, dict):
+                      continue
+                  for key in ("uid", "userId", "user_id"):
+                      value = body.get(key)
+                      if isinstance(value, str) and value.strip():
+                          return value.strip(), region
+                      if isinstance(value, (int, float)):
+                          return str(value), region
+              return None, region + " no-uid"
+
+          uid, info = None, ""
+          errors = []
+          for region in ("global", "cn"):
+              uid, message = uid_of(region)
+              if uid:
+                  info = region + " ok"
+                  break
+              errors.append(message)
+          else:
+              info = "; ".join(errors)
+
+          try:
+              with open("qoder_machine_id", encoding="utf-8") as handle:
+                  mid = handle.read().strip()
+          except OSError:
+              mid = ""
+
+          uid_fp = fp(uid) if uid else "-"
+          uid_tail = uid[-4:] if uid and len(uid) > 4 else ""
+          row = "| {} | {} | `{}` | {} {} | `{}` | {} | `{}` |".format(
+              label, note, fp(access), uid_fp, uid_tail, fp(mid), host, info
+          )
+          header = (
+              "| 账号 | 备注 | token sha256[:12] | UID sha256[:12] | UID 尾号 | machine_id sha256[:12] | 主机名 | 探测结果 |\n"
+              "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+          )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(header + "\n" + row + "\n")
+          print(row)
+          PY
